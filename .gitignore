@@ -1,0 +1,28 @@
+# Environment & Secrets (NEVER COMMIT)
+.env
+*.env
+*.env.local
+
+# Bot Runtime State & History (Local run data)
+bot_state.json
+trades_history.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE & OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
