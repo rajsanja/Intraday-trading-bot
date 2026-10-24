@@ -124,16 +124,22 @@ class Config:
     enable_session_filter: bool = False   # Set True for strict London & NY killzones only
     min_rr: float = 1.8                  # Minimum 1:1.8 Risk:Reward
     min_volume_ratio: float = 1.05       # Volume spike >= 1.05x average
-    max_overextension_pct: float = 0.0035 # 0.35% maximum drift from zone for precision entries
+    max_overextension_pct: float = 0.0025 # 0.25% maximum drift from zone for precision entries
     require_discount_premium: bool = True # Enforce ICT PD Array: buy in Discount (<50%), sell in Premium (>50%)
     enable_ote_filter: bool = True       # Prioritize 0.618 - 0.786 Fibonacci Optimal Trade Entry
-    min_gap_atr_ratio: float = 0.20      # Minimum FVG gap size relative to ATR (filters micro-tick noise)
+    min_gap_atr_ratio: float = 0.25      # Minimum FVG gap size relative to ATR (filters micro-tick noise)
     fee_rate: float = 0.0005             # 0.05% fee estimation
-    min_confluence_score: int = 65       # Minimum 65/100 points for institutional entry
+    min_confluence_score: int = 75       # Minimum 75/100 points for institutional entry
     enable_partial_tp: bool = True       # Take 50% profit at halfway mark
+    enable_trailing_stop: bool = True    # Dynamic profit ratchet after breakeven
+    trailing_stop_trigger_pct: float = 0.65 # Activate profit trailing at 65% of TP distance
+    max_trade_duration_bars: int = 36    # 36 bars = 3 hours on 5m (stale trade chop guard)
+    enable_btc_correlation: bool = True  # Anchor ETH & altcoins to BTC directional trend
+    enable_vwap_filter: bool = True      # Intraday institutional Session VWAP filter
     poll_seconds: int = 10               # 10-second monitoring loop
     cooldown_bars: int = 6               # 6-bar cooldown after a stopped trade
     max_hold_hours: float = 8.0          # Max hold time for intraday trades
+    market_data_provider: str = "binance" # "binance", "live_delta", or "exchange"
     day_tz: str = "Asia/Kolkata"
 
     @property
@@ -164,8 +170,8 @@ def load_config() -> Config:
         market_type=env_str("MARKET_TYPE", "future").lower(),
         symbol=parsed_symbols[0],
         symbols=parsed_symbols,
-        api_key=env_str("API_KEY", "") or env_str("DELTA_API_KEY", "") or env_str("DELTA_KEY", ""),
-        api_secret=env_str("API_SECRET", "") or env_str("DELTA_API_SECRET", "") or env_str("DELTA_SECRET", ""),
+        api_key=env_str("BINANCE_API_KEY", "") or env_str("API_KEY", "") or env_str("DELTA_API_KEY", "") or env_str("DELTA_KEY", ""),
+        api_secret=env_str("BINANCE_API_SECRET", "") or env_str("API_SECRET", "") or env_str("DELTA_API_SECRET", "") or env_str("DELTA_SECRET", ""),
         api_passphrase=env_str("API_PASSPHRASE", ""),
         use_testnet=env_bool("USE_TESTNET", False),
         delta_india=env_bool("DELTA_INDIA", False),
@@ -179,12 +185,18 @@ def load_config() -> Config:
         enable_session_filter=env_bool("ENABLE_SESSION_FILTER", False),
         min_rr=env_float("MIN_RR", 1.8),
         min_volume_ratio=env_float("MIN_VOLUME_RATIO", 1.05),
-        max_overextension_pct=env_float("MAX_OVEREXTENSION_PCT", 0.0035),
+        max_overextension_pct=env_float("MAX_OVEREXTENSION_PCT", 0.0025),
         require_discount_premium=env_bool("REQUIRE_DISCOUNT_PREMIUM", True),
         enable_ote_filter=env_bool("ENABLE_OTE_FILTER", True),
-        min_gap_atr_ratio=env_float("MIN_GAP_ATR_RATIO", 0.20),
-        min_confluence_score=env_int("MIN_CONFLUENCE_SCORE", 65),
+        min_gap_atr_ratio=env_float("MIN_GAP_ATR_RATIO", 0.25),
+        min_confluence_score=env_int("MIN_CONFLUENCE_SCORE", 75),
         enable_partial_tp=env_bool("ENABLE_PARTIAL_TP", True),
+        enable_trailing_stop=env_bool("ENABLE_TRAILING_STOP", True),
+        trailing_stop_trigger_pct=env_float("TRAILING_STOP_TRIGGER_PCT", 0.65),
+        max_trade_duration_bars=env_int("MAX_TRADE_DURATION_BARS", 36),
+        enable_btc_correlation=env_bool("ENABLE_BTC_CORRELATION", True),
+        enable_vwap_filter=env_bool("ENABLE_VWAP_FILTER", True),
+        market_data_provider=env_str("MARKET_DATA_PROVIDER", "binance" if env_bool("USE_TESTNET", False) else "exchange").lower(),
         day_tz=env_str("DAY_TZ", "Asia/Kolkata"),
     )
     if cfg.risk_per_trade <= 0 or cfg.risk_per_trade > 0.1:
@@ -509,6 +521,23 @@ def find_swing_pivots(candles: List[Candle], left: int = 2, right: int = 2) -> T
             swing_lows.append({"index": i, "price": c.low, "candle": c, "ts": c.ts})
 
     return swing_highs, swing_lows
+
+
+def calculate_vwap(candles: List[Candle]) -> float:
+    """
+    Calculates Volume-Weighted Average Price (VWAP) across the session candles:
+    VWAP = sum(typical_price * volume) / sum(volume)
+    where typical_price = (high + low + close) / 3
+    """
+    if not candles:
+        return 0.0
+    cum_pv = 0.0
+    cum_vol = 0.0
+    for c in candles:
+        typ = (c.high + c.low + c.close) / 3.0
+        cum_pv += typ * c.volume
+        cum_vol += c.volume
+    return (cum_pv / cum_vol) if cum_vol > 0 else candles[-1].close
 
 
 def analyze_market_structure(candles: List[Candle]) -> Dict[str, Any]:
@@ -1109,7 +1138,8 @@ def analyze_smc_setup(
     macro_data: Dict[str, List[Candle]],
     setup_data: List[Candle],
     ltf_data: List[Candle],
-    cfg: Config
+    cfg: Config,
+    btc_context: Optional[Dict[str, Any]] = None
 ) -> Tuple[Dict[str, Any], Optional[Signal], List[str]]:
     notes: List[str] = []
     
@@ -1124,6 +1154,7 @@ def analyze_smc_setup(
             "trend_4h": "N/A",
             "bias_1h": "N/A",
             "current_price": ltf_data[-1].close if ltf_data else 0.0,
+            "vwap": ltf_data[-1].close if ltf_data else 0.0,
             "ema20_1h": 0.0,
             "ema50_1h": 0.0,
             "nearest_sup": 0.0,
@@ -1192,6 +1223,7 @@ def analyze_smc_setup(
 
     ltf_adx_series = adx(ltf_highs, ltf_lows, ltf_closes, period=14)
     curr_adx = last_value(ltf_adx_series) or 20.0
+    session_vwap = calculate_vwap(ltf_data) if getattr(cfg, "enable_vwap_filter", True) else current_price
 
     # Multi-bar Liquidity Sweep & MSS Detection
     liq_sweep = detect_liquidity_sweep(ltf_data, lookback=25, sweep_window=6)
@@ -1199,7 +1231,7 @@ def analyze_smc_setup(
 
     # 7. Multi-Zone Scanning for Order Blocks & FVGs
     stf_label = getattr(cfg, "setup_tf", "15m").upper()
-    min_atr_m = getattr(cfg, "min_gap_atr_ratio", 0.20)
+    min_atr_m = getattr(cfg, "min_gap_atr_ratio", 0.25)
 
     all_obs_ltf = detect_order_blocks(ltf_data, lookback=35, expected_type=expected_type)
     all_fvgs_ltf = detect_fvgs(ltf_data, lookback=35, expected_type=expected_type, atr_val=ltf_atr, min_atr_mult=min_atr_m)
@@ -1362,6 +1394,23 @@ def analyze_smc_setup(
             confluence_score = max(0, confluence_score - 10)
             score_breakdown.append(f"RSI Overextended ({curr_rsi:.1f}): -10 Penalty")
 
+        # I. Intraday Session VWAP Confluence (Max 8 pts)
+        if getattr(cfg, "enable_vwap_filter", True) and session_vwap > 0:
+            if overall_bias == "long":
+                if current_price >= session_vwap:
+                    confluence_score += 8
+                    score_breakdown.append(f"Institutional VWAP (Price >= VWAP ${session_vwap:,.2f}): +8")
+                else:
+                    confluence_score = max(0, confluence_score - 6)
+                    score_breakdown.append(f"Below Session VWAP (${session_vwap:,.2f}): -6 Penalty")
+            else:
+                if current_price <= session_vwap:
+                    confluence_score += 8
+                    score_breakdown.append(f"Institutional VWAP (Price <= VWAP ${session_vwap:,.2f}): +8")
+                else:
+                    confluence_score = max(0, confluence_score - 6)
+                    score_breakdown.append(f"Above Session VWAP (${session_vwap:,.2f}): -6 Penalty")
+
     # Confluence Score Quality Tier
     score_label = (
         "A+ ELITE INSTITUTIONAL" if confluence_score >= 85 else (
@@ -1409,6 +1458,7 @@ def analyze_smc_setup(
         "trend_4h": trend_4h,
         "bias_1h": (bias_1h or "NEUTRAL").upper(),
         "current_price": current_price,
+        "vwap": session_vwap,
         "ema20_1h": emas_1h.get("ema20", 0.0),
         "ema50_1h": emas_1h.get("ema50", 0.0),
         "nearest_sup": nearest_sup,
@@ -1448,6 +1498,16 @@ def analyze_smc_setup(
         notes.append("Filtered: Directional bias is neutral/unresolved.")
         return analysis_info, None, notes
 
+    # BTC Macro Correlation Anchor Gate (For ETH & other altcoin pairs)
+    if getattr(cfg, "enable_btc_correlation", True) and btc_context:
+        btc_bias = str(btc_context.get("bias", "")).lower()
+        if overall_bias == "long" and btc_bias == "short":
+            notes.append("BTC Correlation Filter: Altcoin Long blocked by conflicting BTC Bearish Structure.")
+            return analysis_info, None, notes
+        elif overall_bias == "short" and btc_bias == "long":
+            notes.append("BTC Correlation Filter: Altcoin Short blocked by conflicting BTC Bullish Structure.")
+            return analysis_info, None, notes
+
     if overall_bias == "long" and trend_1d == "BEARISH" and trend_4h == "BEARISH":
         notes.append("Filtered: Cannot buy against both 1D and 4H macro downtrend.")
         return analysis_info, None, notes
@@ -1459,6 +1519,7 @@ def analyze_smc_setup(
     # ADX Chop filter
     if curr_adx < 15.0:
         notes.append(f"Filtered: Low ADX ({curr_adx:.1f} < 15.0) indicates choppy consolidation.")
+        return analysis_info, None, notes
         return analysis_info, None, notes
 
     # PD-Array Enforcement Gate (Never buy in Premium / Never sell in Discount)
@@ -1657,6 +1718,7 @@ class DeltaBroker:
         self.contract_sizes: Dict[str, float] = {}
         self.market_infos: Dict[str, Any] = {}
         self.contract_size = 1.0
+        self.data_exchange = None
         self._init_exchange()
 
     def _init_exchange(self):
@@ -1686,14 +1748,52 @@ class DeltaBroker:
 
         if self.cfg.use_testnet:
             try:
-                self.exchange.set_sandbox_mode(True)
-                if ex_name == "delta":
+                if "binance" in ex_name:
+                    if hasattr(self.exchange, "enable_demo_trading"):
+                        self.exchange.enable_demo_trading(True)
+                    else:
+                        self.exchange.set_sandbox_mode(True)
+                elif ex_name == "delta":
+                    self.exchange.set_sandbox_mode(True)
                     self.exchange.urls["api"] = {
                         "public": "https://cdn-ind.testnet.deltaex.org",
                         "private": "https://cdn-ind.testnet.deltaex.org"
                     }
+                else:
+                    self.exchange.set_sandbox_mode(True)
             except Exception:
                 pass
+
+        # Dedicated live market data client for accurate, uncorrupted candles & tickers
+        provider = getattr(self.cfg, "market_data_provider", "exchange").lower()
+        if provider == "binance":
+            try:
+                self.data_exchange = ccxt.binanceusdm({"options": {"defaultType": "future"}, "enableRateLimit": True})
+                self.data_exchange.load_markets()
+            except Exception:
+                try:
+                    self.data_exchange = ccxt.binance({"enableRateLimit": True})
+                    self.data_exchange.load_markets()
+                except Exception:
+                    self.data_exchange = self.exchange
+        elif provider == "live_delta":
+            try:
+                self.data_exchange = ccxt.delta({"options": {"defaultType": "swap"}, "enableRateLimit": True})
+                if self.cfg.delta_india:
+                    self.data_exchange.urls["api"] = {
+                        "public": "https://api.india.delta.exchange",
+                        "private": "https://api.india.delta.exchange"
+                    }
+                else:
+                    self.data_exchange.urls["api"] = {
+                        "public": "https://api.delta.exchange",
+                        "private": "https://api.delta.exchange"
+                    }
+                self.data_exchange.load_markets()
+            except Exception:
+                self.data_exchange = self.exchange
+        else:
+            self.data_exchange = self.exchange
 
     def get_resolved_symbol(self, sym: Optional[str] = None) -> str:
         sym = sym or self.symbol
@@ -1708,6 +1808,19 @@ class DeltaBroker:
     def _resolve_single_symbol(self, sym: str) -> str:
         if not self.exchange or not self.exchange.markets:
             return sym
+        ex_id = getattr(self.exchange, "id", "")
+        if "binance" in ex_id:
+            clean_base = sym.split("/")[0].upper()
+            pair = f"{clean_base}/USDT:USDT" if f"{clean_base}/USDT:USDT" in self.exchange.markets else (f"{clean_base}/USDT" if f"{clean_base}/USDT" in self.exchange.markets else sym)
+            self.resolved_symbols[sym] = pair
+            market = self.exchange.market(pair) if pair in self.exchange.markets else {}
+            c_size = float(market.get("precision", {}).get("amount") or market.get("limits", {}).get("amount", {}).get("min") or 0.001)
+            self.contract_sizes[pair] = c_size
+            self.contract_sizes[sym] = c_size
+            self.market_infos[pair] = market
+            self.market_infos[sym] = market
+            return pair
+
         base = sym.split("/")[0].upper()
         resolved = None
         for m_id, m in self.exchange.markets.items():
@@ -1737,6 +1850,103 @@ class DeltaBroker:
         self.contract_size = self.get_contract_size(self.symbol)
 
     def connect(self) -> bool:
+        load_env_file(ENV_PATH)
+        ex_name = self.cfg.exchange.lower()
+
+        if "binance" in ex_name:
+            print("\n" + "=" * 70)
+            print("🔄 CONNECTING TO BINANCE FUTURES...")
+            print("=" * 70)
+
+            key = env_str("BINANCE_API_KEY", "") or (env_str("API_KEY", "") if "binance" in env_str("EXCHANGE", "").lower() else "")
+            secret = env_str("BINANCE_API_SECRET", "") or (env_str("API_SECRET", "") if "binance" in env_str("EXCHANGE", "").lower() else "")
+            if key:
+                self.cfg.api_key = key
+            if secret:
+                self.cfg.api_secret = secret
+
+            has_keys = bool(self.cfg.api_key and self.cfg.api_secret)
+            opts = {
+                "enableRateLimit": True,
+                "options": {"defaultType": "future"}
+            }
+            if has_keys:
+                opts["apiKey"] = self.cfg.api_key
+                opts["secret"] = self.cfg.api_secret
+
+            self.exchange = ccxt.binanceusdm(opts) if self.cfg.market_type == "future" else ccxt.binance(opts)
+            if self.cfg.use_testnet:
+                if hasattr(self.exchange, "enable_demo_trading"):
+                    self.exchange.enable_demo_trading(True)
+                else:
+                    self.exchange.set_sandbox_mode(True)
+
+            found_balance = 0.0
+            if has_keys:
+                try:
+                    bal = self.exchange.fetch_balance()
+                    usdt = bal.get("USDT") or bal.get("USD") or {}
+                    found_balance = float(usdt.get("total") or usdt.get("free") or 0.0)
+                except Exception as e:
+                    if self.cfg.live_orders:
+                        print("======================================================================")
+                        print("❌ BINANCE API AUTHENTICATION FAILED!")
+                        print("======================================================================")
+                        print(f"• Error: {e}")
+                        print("• Fix: Verify BINANCE_API_KEY and BINANCE_API_SECRET in .env.")
+                        if self.cfg.use_testnet:
+                            print("  (For demo trading, keys must come from https://demo.binance.com)")
+                            print("  (Or set PAPER_TRADING=true and USE_TESTNET=false for instant risk-free testing)")
+                        print("======================================================================\n")
+                        return False
+                    else:
+                        print(f"ℹ️ Binance auth notice: {e}. Continuing in Paper Trading mode.")
+                        has_keys = False
+                        opts.pop("apiKey", None)
+                        opts.pop("secret", None)
+                        self.exchange = ccxt.binanceusdm(opts) if self.cfg.market_type == "future" else ccxt.binance(opts)
+                        if self.cfg.use_testnet and hasattr(self.exchange, "enable_demo_trading"):
+                            self.exchange.enable_demo_trading(True)
+
+            if not has_keys:
+                found_balance = float(self.state.get("equity") or 1000.0) if self.state else 1000.0
+
+            env_label = "BINANCE FUTURES (TESTNET)" if self.cfg.use_testnet else "BINANCE FUTURES (LIVE)"
+            exec_mode = "LIVE EXECUTION" if (self.cfg.live_orders and has_keys) else "PAPER TRADING (SIMULATION)"
+            print("======================================================================")
+            print("✅ BINANCE CONNECTED SUCCESSFULLY!")
+            print("======================================================================")
+            print(f"| Exchange Platform          | {env_label:<36} |")
+            print(f"| Mode                       | {exec_mode:<36} |")
+            if has_keys:
+                print(f"| Dynamic Exchange Balance   | ${found_balance:<35,.2f} |")
+            else:
+                print(f"| Dynamic Exchange Balance   | {'Simulation / Paper Mode':<36} |")
+
+            try:
+                self.exchange.load_markets()
+                self._resolve_symbols()
+                print(f"| Market Data Feed (SMC)     | {'BINANCE FUTURES (LIVE)':<36} |")
+                for s in self.cfg.symbols:
+                    res_s = self.get_resolved_symbol(s)
+                    cs = self.get_contract_size(s)
+                    print(f"| Traded Pair                | {f'{res_s} (Min: {cs})':<36} |")
+                    if self.cfg.market_type == "future" and has_keys:
+                        try:
+                            self.exchange.set_leverage(self.cfg.leverage, res_s)
+                        except Exception:
+                            pass
+                print(f"| Institutional Leverage     | {str(self.cfg.leverage)+'x':<36} |")
+            except Exception:
+                pass
+            print("======================================================================\n")
+
+            if self.state is not None and found_balance > 0:
+                self.state["equity"] = found_balance
+                self.state["day_start_equity"] = found_balance
+                save_state(self.state)
+            return True
+
         print("\n" + "=" * 70)
         print("🔄 CONNECTING TO DELTA EXCHANGE...")
         print("=" * 70)
@@ -1878,6 +2088,8 @@ class DeltaBroker:
             try:
                 self.exchange.load_markets()
                 self._resolve_symbols()
+                data_feed_lbl = "BINANCE FUTURES (LIVE)" if getattr(self.data_exchange, "id", "") in ("binance", "binanceusdm") else ("DELTA LIVE" if getattr(self.data_exchange, "id", "") == "delta" and not self.cfg.use_testnet else connected_label)
+                print(f"| Market Data Feed (SMC)     | {data_feed_lbl:<36} |")
                 for s in self.cfg.symbols:
                     res_s = self.get_resolved_symbol(s)
                     cs = self.get_contract_size(s)
@@ -1921,12 +2133,25 @@ class DeltaBroker:
             return False
 
     def fetch_candles(self, timeframe: str, limit: int = 250, symbol: Optional[str] = None) -> List[Candle]:
-        target_sym = self.get_resolved_symbol(symbol)
+        dex = getattr(self, "data_exchange", None) or self.exchange
+        if dex is None:
+            return []
+
+        raw_sym = symbol or self.cfg.symbols[0]
+        if hasattr(dex, "id") and dex.id in ("binance", "binanceusdm"):
+            clean_base = raw_sym.split("/")[0].upper()
+            target_sym = f"{clean_base}/USDT"
+        elif hasattr(dex, "id") and dex.id == "delta" and dex != self.exchange:
+            clean_base = raw_sym.split("/")[0].upper()
+            target_sym = f"{clean_base}/USDT:USDT" if f"{clean_base}/USDT:USDT" in getattr(dex, "markets", {}) else f"{clean_base}/USDT"
+        else:
+            target_sym = self.get_resolved_symbol(symbol)
+
         try:
-            rows = self.exchange.fetch_ohlcv(target_sym, timeframe, limit=limit)
+            rows = dex.fetch_ohlcv(target_sym, timeframe, limit=limit)
             candles = [Candle(int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])) for r in rows]
             tf_ms = tf_seconds(timeframe) * 1000
-            now = self.exchange.milliseconds()
+            now = dex.milliseconds() if hasattr(dex, "milliseconds") else int(time.time() * 1000)
             if candles and candles[-1].ts + tf_ms > now:
                 candles.pop()
             return candles
@@ -1935,9 +2160,22 @@ class DeltaBroker:
             return []
 
     def fetch_ticker_price(self, symbol: Optional[str] = None) -> float:
-        target_sym = self.get_resolved_symbol(symbol)
+        dex = getattr(self, "data_exchange", None) or self.exchange
+        if dex is None:
+            return 0.0
+
+        raw_sym = symbol or self.cfg.symbols[0]
+        if hasattr(dex, "id") and dex.id in ("binance", "binanceusdm"):
+            clean_base = raw_sym.split("/")[0].upper()
+            target_sym = f"{clean_base}/USDT"
+        elif hasattr(dex, "id") and dex.id == "delta" and dex != self.exchange:
+            clean_base = raw_sym.split("/")[0].upper()
+            target_sym = f"{clean_base}/USDT:USDT" if f"{clean_base}/USDT:USDT" in getattr(dex, "markets", {}) else f"{clean_base}/USDT"
+        else:
+            target_sym = self.get_resolved_symbol(symbol)
+
         try:
-            t = self.exchange.fetch_ticker(target_sym)
+            t = dex.fetch_ticker(target_sym)
             return float(t.get("last") or t.get("close") or 0.0)
         except Exception:
             return 0.0
@@ -1979,12 +2217,21 @@ class DeltaBroker:
     def place_market_order(self, side: str, contracts: int, symbol: Optional[str] = None) -> Optional[Dict[str, Any]]:
         target_sym = self.get_resolved_symbol(symbol)
         order_side = "buy" if side.lower() in ("long", "buy") else "sell"
+        ex_id = getattr(self.exchange, "id", "")
+        c_size = self.get_contract_size(symbol)
+
+        if "binance" in ex_id:
+            raw_amt = contracts * c_size
+            amt = float(self.exchange.amount_to_precision(target_sym, raw_amt)) if hasattr(self.exchange, "amount_to_precision") else raw_amt
+        else:
+            amt = int(contracts) if contracts else 1
+
         try:
             order = self.exchange.create_order(
                 symbol=target_sym,
                 type="market",
                 side=order_side,
-                amount=int(contracts) if contracts else 1
+                amount=amt
             )
             return order
         except Exception as e:
@@ -1995,24 +2242,44 @@ class DeltaBroker:
         if not self.exchange or not self.cfg.live_orders:
             return None
         target_sym = self.get_resolved_symbol(symbol)
+        ex_id = getattr(self.exchange, "id", "")
+        c_size = self.get_contract_size(symbol)
+
         try:
-            p = self.exchange.fetch_position(target_sym)
-            contracts = abs(float(p.get("contracts") or p.get("info", {}).get("size") or 0.0))
-            side = p.get("side")
-            if not side and p.get("info", {}).get("size"):
-                try:
-                    s_val = float(p["info"]["size"])
-                    side = "buy" if s_val > 0 else ("sell" if s_val < 0 else None)
-                except Exception:
-                    side = None
-            return {
-                "contracts": contracts,
-                "side": side,
-                "entry_price": p.get("entryPrice") or p.get("info", {}).get("entry_price"),
-                "raw": p
-            }
+            if "binance" in ex_id:
+                positions = self.exchange.fetch_positions([target_sym]) if hasattr(self.exchange, "fetch_positions") else [self.exchange.fetch_position(target_sym)]
+                for p in positions:
+                    m_sym = target_sym.replace("/", "").replace(":USDT", "")
+                    if p.get("symbol") == target_sym or p.get("info", {}).get("symbol") == m_sym:
+                        amt = abs(float(p.get("contracts") or p.get("info", {}).get("positionAmt") or 0.0))
+                        contracts = int(round(amt / c_size)) if c_size > 0 else int(amt)
+                        p_amt = float(p.get("info", {}).get("positionAmt", 0.0) or 0.0)
+                        side = "buy" if p_amt > 0 else ("sell" if p_amt < 0 else None)
+                        return {
+                            "contracts": contracts,
+                            "side": side,
+                            "entry_price": float(p.get("entryPrice") or p.get("info", {}).get("entryPrice") or 0.0),
+                            "raw": p
+                        }
+            else:
+                p = self.exchange.fetch_position(target_sym)
+                contracts = abs(float(p.get("contracts") or p.get("info", {}).get("size") or 0.0))
+                side = p.get("side")
+                if not side and p.get("info", {}).get("size"):
+                    try:
+                        s_val = float(p["info"]["size"])
+                        side = "buy" if s_val > 0 else ("sell" if s_val < 0 else None)
+                    except Exception:
+                        side = None
+                return {
+                    "contracts": contracts,
+                    "side": side,
+                    "entry_price": p.get("entryPrice") or p.get("info", {}).get("entry_price"),
+                    "raw": p
+                }
         except Exception:
             return None
+        return None
 
     def check_order_status(self, order_id: Optional[str], symbol: Optional[str] = None) -> Optional[Dict[str, Any]]:
         if not order_id or not self.exchange or not self.cfg.live_orders or str(order_id).strip() in {"paper_sl", "paper_tp", "None", "null", ""}:
@@ -2025,7 +2292,7 @@ class DeltaBroker:
                 "status": str(o.get("status") or "").lower(),
                 "type": o.get("type"),
                 "stop_order_type": o.get("info", {}).get("stop_order_type"),
-                "average": float(o.get("average") or o.get("info", {}).get("average_fill_price") or 0.0) or None,
+                "average": float(o.get("average") or o.get("info", {}).get("avgPrice") or o.get("info", {}).get("average_fill_price") or 0.0) or None,
                 "amount": float(o.get("amount") or 0.0)
             }
         except Exception:
@@ -2034,8 +2301,18 @@ class DeltaBroker:
     def close_position_order(self, side: str, contracts: int, symbol: Optional[str] = None) -> Optional[Dict[str, Any]]:
         target_sym = self.get_resolved_symbol(symbol)
         close_side = "sell" if side.lower() in ("long", "buy") else "buy"
+        ex_id = getattr(self.exchange, "id", "")
+        c_size = self.get_contract_size(symbol)
+
+        if "binance" in ex_id:
+            raw_amt = contracts * c_size
+            amt = float(self.exchange.amount_to_precision(target_sym, raw_amt)) if hasattr(self.exchange, "amount_to_precision") else raw_amt
+            params = {"reduceOnly": True}
+        else:
+            amt = int(contracts) if contracts else 1
+            params = {"reduceOnly": True, "reduce_only": True}
+
         try:
-            # Check if live position on exchange is already 0
             open_pos = self.get_open_position(symbol)
             if open_pos is not None and open_pos.get("contracts", 0.0) == 0.0:
                 log(f"ℹ️ [EXCHANGE SYNC] Position on {target_sym} is already closed on exchange (0 open contracts).")
@@ -2045,15 +2322,26 @@ class DeltaBroker:
                 symbol=target_sym,
                 type="market",
                 side=close_side,
-                amount=int(contracts) if contracts else 1,
-                params={"reduceOnly": True, "reduce_only": True}
+                amount=amt,
+                params=params
             )
             return order
         except Exception as e:
             err_msg = str(e).lower()
             if "no_position_for_reduce_only" in err_msg or "position does not exist" in err_msg:
-                log(f"ℹ️ [EXCHANGE SYNC] Position on {target_sym} already closed on Delta (0 open contracts remaining).")
+                log(f"ℹ️ [EXCHANGE SYNC] Position on {target_sym} already closed on exchange (0 open contracts remaining).")
                 return {"status": "already_closed", "id": None}
+            if "binance" in ex_id and ("reduceonly" in err_msg or "-2022" in err_msg):
+                try:
+                    order = self.exchange.create_order(
+                        symbol=target_sym,
+                        type="market",
+                        side=close_side,
+                        amount=amt
+                    )
+                    return order
+                except Exception:
+                    pass
             log(f"❌ Failed to close position on {target_sym}: {e}")
             return None
 
@@ -2063,53 +2351,83 @@ class DeltaBroker:
 
         target_sym = self.get_resolved_symbol(symbol)
         close_side = "sell" if side.lower() in ("long", "buy") else "buy"
+        ex_id = getattr(self.exchange, "id", "")
+        c_size = self.get_contract_size(symbol)
+
+        if "binance" in ex_id:
+            raw_amt = contracts * c_size
+            amt = float(self.exchange.amount_to_precision(target_sym, raw_amt)) if hasattr(self.exchange, "amount_to_precision") else raw_amt
+            is_binance = True
+        else:
+            amt = int(contracts) if contracts else 1
+            is_binance = False
+
         sl_id = None
         tp_id = None
-        amt = int(contracts) if contracts else 1
-        
+
         if sl is not None:
             try:
                 sl_price = self.exchange.price_to_precision(target_sym, sl) if hasattr(self.exchange, "price_to_precision") else str(sl)
-                sl_order = self.exchange.create_order(
-                    symbol=target_sym,
-                    type="market",
-                    side=close_side,
-                    amount=amt,
-                    params={
-                        "stop_order_type": "stop_loss_order",
-                        "stop_price": str(sl_price),
-                        "stop_trigger_method": "mark_price",
-                        "close_on_trigger": True,
-                        "reduce_only": True,
-                        "reduceOnly": True
-                    }
-                )
+                if is_binance:
+                    sl_order = self.exchange.create_order(
+                        symbol=target_sym,
+                        type="STOP_MARKET",
+                        side=close_side,
+                        amount=amt,
+                        params={"stopPrice": float(sl_price), "reduceOnly": True}
+                    )
+                else:
+                    sl_order = self.exchange.create_order(
+                        symbol=target_sym,
+                        type="market",
+                        side=close_side,
+                        amount=amt,
+                        params={
+                            "stop_order_type": "stop_loss_order",
+                            "stop_price": str(sl_price),
+                            "stop_trigger_method": "mark_price",
+                            "close_on_trigger": True,
+                            "reduce_only": True,
+                            "reduceOnly": True
+                        }
+                    )
                 if isinstance(sl_order, dict) and sl_order.get("id") is not None:
                     sl_id = str(sl_order["id"])
-                    log(f"🛡️ [DELTA CLOUD STOP LOSS] Placed at ${float(sl):,.2f} for {target_sym} | Order ID: {sl_id}")
+                    platform = "BINANCE CLOUD STOP" if is_binance else "DELTA CLOUD STOP"
+                    log(f"🛡️ [{platform}] Placed at ${float(sl):,.2f} for {target_sym} | Order ID: {sl_id}")
             except Exception as e:
                 log(f"⚠️ Native Stop-Loss order not placed on {target_sym}: {e}. Local ticker ratchet will protect trade.")
 
         if tp is not None:
             try:
                 tp_price = self.exchange.price_to_precision(target_sym, tp) if hasattr(self.exchange, "price_to_precision") else str(tp)
-                tp_order = self.exchange.create_order(
-                    symbol=target_sym,
-                    type="market",
-                    side=close_side,
-                    amount=amt,
-                    params={
-                        "stop_order_type": "take_profit_order",
-                        "stop_price": str(tp_price),
-                        "stop_trigger_method": "mark_price",
-                        "close_on_trigger": True,
-                        "reduce_only": True,
-                        "reduceOnly": True
-                    }
-                )
+                if is_binance:
+                    tp_order = self.exchange.create_order(
+                        symbol=target_sym,
+                        type="TAKE_PROFIT_MARKET",
+                        side=close_side,
+                        amount=amt,
+                        params={"stopPrice": float(tp_price), "reduceOnly": True}
+                    )
+                else:
+                    tp_order = self.exchange.create_order(
+                        symbol=target_sym,
+                        type="market",
+                        side=close_side,
+                        amount=amt,
+                        params={
+                            "stop_order_type": "take_profit_order",
+                            "stop_price": str(tp_price),
+                            "stop_trigger_method": "mark_price",
+                            "close_on_trigger": True,
+                            "reduce_only": True,
+                            "reduceOnly": True
+                        }
+                    )
                 if isinstance(tp_order, dict) and tp_order.get("id") is not None:
                     tp_id = str(tp_order["id"])
-                    log(f"🎯 [DELTA CLOUD TAKE PROFIT] Placed at ${float(tp):,.2f} for {target_sym} | Order ID: {tp_id}")
+                    platform = "BINANCE CLOUD TP" if is_binance else "DELTA CLOUD TP"
+                    log(f"🎯 [{platform}] Placed at ${float(tp):,.2f} for {target_sym} | Order ID: {tp_id}")
             except Exception as e:
                 log(f"⚠️ Native Take-Profit order not placed on {target_sym}: {e}. Local ticker ratchet will protect trade.")
 
@@ -2177,6 +2495,8 @@ def print_smc_structure_box(symbol: str, info: Dict[str, Any]):
     print(f"| Live Market Price          | ${info.get('current_price', 0.0):<35,.2f} |")
     print(f"| Institutional Resistance   | ${info.get('nearest_res', 0.0):<35,.2f} |")
     print(f"| Institutional Support      | ${info.get('nearest_sup', 0.0):<35,.2f} |")
+    if info.get("vwap"):
+        print(f"| Session VWAP Benchmark     | ${info.get('vwap', 0.0):<35,.2f} |")
     
     # Premium / Discount & OTE
     pd_str = str(info.get("pd_status", "N/A"))
@@ -2239,6 +2559,49 @@ class IntradayBot:
         self.state = load_state(cfg)
         self.broker = DeltaBroker(cfg, self.state)
 
+    def _scan_and_execute(self, current_equity: float):
+        best_signal = None
+        best_sym = None
+        btc_context = None
+
+        # Ensure BTC is analyzed first to provide market anchor context
+        sorted_symbols = sorted(self.cfg.symbols, key=lambda s: 0 if "BTC" in s.upper() else 1)
+
+        for sym in sorted_symbols:
+            ltf_candles = self.broker.fetch_candles(self.cfg.ltf, 150, symbol=sym)
+            if not ltf_candles:
+                continue
+
+            setup_candles = self.broker.fetch_candles(SETUP_TIMEFRAME, 150, symbol=sym)
+            macro_data = {
+                "4h": self.broker.fetch_candles("4h", 120, symbol=sym),
+                "1d": self.broker.fetch_candles("1d", 100, symbol=sym),
+                "1w": self.broker.fetch_candles("1w", 50, symbol=sym),
+            }
+
+            is_btc = "BTC" in sym.upper()
+            ctx_for_pair = None if is_btc else btc_context
+
+            analysis_info, signal, notes = analyze_smc_setup(macro_data, setup_candles, ltf_candles, self.cfg, btc_context=ctx_for_pair)
+            if is_btc:
+                btc_context = {
+                    "bias": analysis_info.get("bias_1h", "NEUTRAL").lower(),
+                    "trend_4h": analysis_info.get("trend_4h", "RANGE"),
+                    "price": analysis_info.get("current_price", 0.0)
+                }
+
+            print_smc_structure_box(sym, analysis_info)
+
+            for note in notes:
+                log(f"   • [{sym}] {note}")
+
+            if signal and (best_signal is None or signal.score > best_signal.score):
+                best_signal = signal
+                best_sym = sym
+
+        if best_signal and best_sym:
+            self.execute_entry(best_signal, current_equity, symbol=best_sym)
+
     def run(self):
         log("=" * 70)
         syms_str = ", ".join(self.cfg.symbols)
@@ -2249,7 +2612,22 @@ class IntradayBot:
         log("=" * 70)
 
         self.broker.connect()
-        current_day = datetime.now().strftime("%Y-%m-%d")
+
+        # Initial Fast Bootstrap: display initial dashboard and scan once on startup
+        current_equity = self.broker.get_equity()
+        pos = self.state.get("position")
+        active_sym = pos.get("symbol") if pos else self.cfg.symbols[0]
+        current_price = self.broker.fetch_ticker_price(active_sym)
+        if current_price <= 0 and pos:
+            current_price = pos["entry"]
+        print_portfolio_dashboard(pos, current_price, current_equity, self.state.get("daily_loss", 0.0), self.state.get("trades_today", 0))
+
+        log("⚡ [FAST BOOTSTRAP] Performing immediate initial SMC market scan across all pairs...")
+        self._scan_and_execute(current_equity)
+
+        # Mark current candle bar as scanned to avoid duplicate re-scans before next close
+        secs = tf_seconds(self.cfg.ltf)
+        last_scanned_bar_ts = int(time.time() // secs) * secs
 
         while True:
             try:
@@ -2269,19 +2647,7 @@ class IntradayBot:
                     time.sleep(300)
                     continue
 
-                # 2. Monitor Active Position (Fast 10s Ticker Cycle)
-                pos = self.state.get("position")
-                active_sym = pos.get("symbol") if pos else self.cfg.symbols[0]
-                current_price = self.broker.fetch_ticker_price(active_sym)
-                if current_price <= 0 and pos:
-                    current_price = pos["entry"]
-
-                print_portfolio_dashboard(pos, current_price, current_equity, self.state.get("daily_loss", 0.0), self.state.get("trades_today", 0))
-
-                if pos:
-                    self.manage_active_position(pos, current_price)
-
-                # 3. Check Post-Trade Cooldown
+                # 2. Check Post-Trade Cooldown
                 now_ms = int(time.time() * 1000)
                 cooldown_ts = int(self.state.get("cooldown_until_ts", 0))
                 if now_ms < cooldown_ts and not self.state.get("position"):
@@ -2290,55 +2656,59 @@ class IntradayBot:
                     time.sleep(min(rem_sec, 15))
                     continue
 
-                # 4. Fast Bootstrap Initial Scan or Candle Close Wait
-                if not hasattr(self, "_has_initial_scanned"):
-                    self._has_initial_scanned = True
-                    log("⚡ [FAST BOOTSTRAP] Performing immediate initial SMC market scan across all pairs...")
-                else:
-                    target = get_next_candle_target(self.cfg.ltf)
-                    remaining = target["remaining_seconds"]
+                # 3. Synchronize with Next Candle Close
+                target = get_next_candle_target(self.cfg.ltf)
+                remaining = target["remaining_seconds"]
 
-                    if remaining > 15:
+                if remaining > 2.0:
+                    pos = self.state.get("position")
+                    if pos:
+                        # ACTIVE POSITION: Guard SL/TP/trailing stop every poll interval
+                        sleep_step = min(self.cfg.poll_seconds, remaining - 1.0)
+                        time.sleep(max(1.0, sleep_step))
+                        cur_p = self.broker.fetch_ticker_price(pos.get("symbol"))
+                        self.manage_active_position(pos, cur_p)
+                        continue
+                    else:
+                        # STANDBY MODE: Wait peacefully until candle close
                         log(f"💤 Next {self.cfg.ltf} candle close at {target['target_local']} ({target['minutes']:.2f} mins remaining)...")
-                        while remaining > 10:
-                            sleep_step = min(self.cfg.poll_seconds, remaining - 5)
-                            time.sleep(sleep_step)
+                        while remaining > 2.0:
+                            # Sleep in calm chunks up to 30 seconds
+                            sleep_chunk = min(30.0, remaining - 1.5)
+                            if sleep_chunk <= 0:
+                                time.sleep(remaining + 1.5)
+                                break
+                            time.sleep(sleep_chunk)
                             target = get_next_candle_target(self.cfg.ltf)
                             remaining = target["remaining_seconds"]
-                            pos = self.state.get("position")
-                            if pos:
-                                current_price = self.broker.fetch_ticker_price(pos.get("symbol"))
-                                self.manage_active_position(pos, current_price)
+                            if self.state.get("position"):
+                                break
+
+                # 4. Candle Close Rollover: Add 1.5s grace buffer for exchange to commit OHLCV
+                time.sleep(1.5)
+                now_epoch = time.time()
+                closed_bar_ts = int(now_epoch // secs) * secs
+
+                if closed_bar_ts <= last_scanned_bar_ts:
+                    time.sleep(1.0)
+                    continue
+
+                last_scanned_bar_ts = closed_bar_ts
+
+                # Print clean Portfolio Dashboard at candle close
+                pos = self.state.get("position")
+                active_sym = pos.get("symbol") if pos else self.cfg.symbols[0]
+                current_price = self.broker.fetch_ticker_price(active_sym)
+                if current_price <= 0 and pos:
+                    current_price = pos["entry"]
+                print_portfolio_dashboard(pos, current_price, current_equity, self.state.get("daily_loss", 0.0), self.state.get("trades_today", 0))
+
+                if pos:
+                    self.manage_active_position(pos, current_price)
 
                 # 5. Multi-Pair SMC Scan across all configured symbols (BTC, ETH)
                 if not self.state.get("position") and int(time.time() * 1000) >= int(self.state.get("cooldown_until_ts", 0)):
-                    best_signal = None
-                    best_sym = None
-
-                    for sym in self.cfg.symbols:
-                        ltf_candles = self.broker.fetch_candles(self.cfg.ltf, 150, symbol=sym)
-                        if not ltf_candles:
-                            continue
-
-                        setup_candles = self.broker.fetch_candles(SETUP_TIMEFRAME, 150, symbol=sym)
-                        macro_data = {
-                            "4h": self.broker.fetch_candles("4h", 120, symbol=sym),
-                            "1d": self.broker.fetch_candles("1d", 100, symbol=sym),
-                            "1w": self.broker.fetch_candles("1w", 50, symbol=sym),
-                        }
-
-                        analysis_info, signal, notes = analyze_smc_setup(macro_data, setup_candles, ltf_candles, self.cfg)
-                        print_smc_structure_box(sym, analysis_info)
-
-                        for note in notes:
-                            log(f"   • [{sym}] {note}")
-
-                        if signal and (best_signal is None or signal.score > best_signal.score):
-                            best_signal = signal
-                            best_sym = sym
-
-                    if best_signal and best_sym:
-                        self.execute_entry(best_signal, current_equity, symbol=best_sym)
+                    self._scan_and_execute(current_equity)
 
             except KeyboardInterrupt:
                 log("🛑 Bot stopped safely by user. Active protection orders remain on exchange.")
@@ -2527,6 +2897,71 @@ class IntradayBot:
                 pos["sl_order_id"] = new_sl_id
                 save_state(self.state)
 
+        # 3.1 Dynamic Profit Ratchet (Trailing Stop once in deep profit)
+        if getattr(self.cfg, "enable_trailing_stop", True) and pos.get("breakeven"):
+            dist = abs(tp - entry)
+            if dist > 0:
+                progress = abs(current_price - entry) / dist
+                target_lock_ratio = 0.0
+                if progress >= 0.85:
+                    target_lock_ratio = 0.60
+                elif progress >= getattr(self.cfg, "trailing_stop_trigger_pct", 0.65):
+                    target_lock_ratio = 0.35
+
+                if target_lock_ratio > 0.0:
+                    cand_sl = (entry + dist * target_lock_ratio) if side == "long" else (entry - dist * target_lock_ratio)
+                    cand_sl = round(cand_sl, 2)
+                    is_better = (cand_sl > sl) if side == "long" else (cand_sl < sl)
+                    if is_better:
+                        pos["sl"] = cand_sl
+                        log(f"📈 [PROFIT RATCHET] Price reached {progress*100:.1f}% of target on {pos_sym}! Advanced Trailing Stop to ${cand_sl:,.2f} (Locked +{target_lock_ratio*100:.0f}% profit).")
+                        if self.cfg.live_orders:
+                            self.broker.cancel_order(pos.get("sl_order_id"), symbol=pos_sym, reason="Advancing trailing stop ratchet")
+                            new_sl_id, _ = self.broker.place_native_stops(side, pos["contracts"], sl=cand_sl, tp=None, symbol=pos_sym)
+                            pos["sl_order_id"] = new_sl_id
+                        save_state(self.state)
+
+        # 3.2 Stale Trade / Consolidation Guard (Prevent capital lockup in dead chop)
+        max_bars = getattr(self.cfg, "max_trade_duration_bars", 36)
+        entered_iso = pos.get("entered_at")
+        if max_bars > 0 and entered_iso:
+            try:
+                entered_dt = datetime.fromisoformat(entered_iso)
+                elapsed_sec = (datetime.now() - entered_dt).total_seconds()
+                bars_elapsed = elapsed_sec / tf_seconds(self.cfg.ltf)
+                if bars_elapsed >= max_bars and not pos.get("partial_tp_hit"):
+                    drift_from_entry = abs(current_price - entry) / entry
+                    if drift_from_entry < 0.003:
+                        log(f"⏱️ [STALE TRADE GUARD] Trade has been stagnant for {bars_elapsed:.0f} bars ({elapsed_sec/3600:.1f}h) near entry (${current_price:,.2f}). Gracefully closing position.")
+                        if self.cfg.live_orders:
+                            self.broker.close_position_order(side, pos["contracts"], symbol=pos_sym)
+                            self.broker.cancel_order(pos.get("sl_order_id"), symbol=pos_sym, reason="Stale trade exit")
+                            self.broker.cancel_order(pos.get("tp_order_id"), symbol=pos_sym, reason="Stale trade exit")
+
+                        diff = (current_price - entry) if side == "long" else (entry - current_price)
+                        pnl_usd = diff * pos["coin_qty"]
+                        pnl_pct = (diff / entry) * 100 if entry > 0 else 0.0
+
+                        self.state["equity"] = float(self.state.get("equity", 0.0)) + pnl_usd
+                        self.state["cooldown_until_ts"] = int(time.time() * 1000) + (self.cfg.cooldown_bars * tf_seconds(self.cfg.ltf) * 1000)
+                        self.state["position"] = None
+                        save_state(self.state)
+
+                        record_trade({
+                            "symbol": pos_sym,
+                            "side": side.upper(),
+                            "entry": entry,
+                            "exit": current_price,
+                            "contracts": pos["contracts"],
+                            "qty": pos["coin_qty"],
+                            "pnl_usd": round(pnl_usd, 2),
+                            "pnl_pct": round(pnl_pct, 2),
+                            "reason": "Stale Trade Time Exit ⏱️"
+                        })
+                        return
+            except Exception:
+                pass
+
         # 4. Full Take Profit Hit
         hit_tp = (current_price >= tp) if side == "long" else (current_price <= tp)
         if hit_tp:
@@ -2651,10 +3086,48 @@ def main():
     parser = argparse.ArgumentParser(description="Institutional SMC Intraday Trading Bot")
     parser.add_argument("--once", action="store_true", help="Perform single scan analysis and exit")
     parser.add_argument("--selftest", action="store_true", help="Verify mathematical and indicator logic")
+    parser.add_argument("--reset", action="store_true", help="Completely reset bot state, trade history, and active positions for a fresh start")
+    parser.add_argument("--reset-equity", type=float, default=None, help="Set initial starting equity when resetting (e.g. --reset-equity 1000)")
     parser.add_argument("--reset-daily-loss", action="store_true", help="Reset today's daily loss tracker to unpause trading")
     args = parser.parse_args()
 
     cfg = load_config()
+
+    if args.reset:
+        start_eq = args.reset_equity if args.reset_equity is not None else 1000.0
+        new_state = {
+            "equity": start_eq,
+            "day": datetime.now().strftime("%Y-%m-%d"),
+            "day_start_equity": start_eq,
+            "daily_loss": 0.0,
+            "trades_today": 0,
+            "day_r": 0.0,
+            "cooldown_until_ts": 0,
+            "position": None,
+            "breakeven_triggered": False,
+            "last_candle_ts": 0,
+            "exchange": cfg.exchange,
+            "symbols": cfg.symbols,
+        }
+        save_state(new_state)
+        try:
+            with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+                json.dump([], f, indent=2)
+        except Exception:
+            pass
+
+        print("=" * 70)
+        print("🧹 BOT STATE & TRADE HISTORY COMPLETELY RESET!")
+        print("=" * 70)
+        print("• Active Position   : CLEARED (None)")
+        print("• Trade History     : CLEARED (0 trades)")
+        print(f"• Starting Equity   : ${start_eq:,.2f}")
+        print("• Daily Loss & PnL  : $0.00")
+        print("• Cooldown Status   : READY (0s remaining)")
+        print(f"• Traded Exchange   : {cfg.exchange.upper()}")
+        print("=" * 70)
+        print("👉 You are ready to start fresh! Run: py intraday_bot.py\n")
+        return
 
     if args.reset_daily_loss:
         state = load_state(cfg)
@@ -2727,7 +3200,9 @@ def main():
     if args.once:
         broker = bot.broker
         broker.connect()
-        for sym in cfg.symbols:
+        btc_context = None
+        sorted_symbols = sorted(cfg.symbols, key=lambda s: 0 if "BTC" in s.upper() else 1)
+        for sym in sorted_symbols:
             ltf = broker.fetch_candles(cfg.ltf, 150, symbol=sym)
             setup = broker.fetch_candles(SETUP_TIMEFRAME, 150, symbol=sym)
             macro = {
@@ -2735,7 +3210,15 @@ def main():
                 "1d": broker.fetch_candles("1d", 100, symbol=sym),
                 "1w": broker.fetch_candles("1w", 50, symbol=sym),
             }
-            info, sig, notes = analyze_smc_setup(macro, setup, ltf, cfg)
+            is_btc = "BTC" in sym.upper()
+            ctx_for_pair = None if is_btc else btc_context
+            info, sig, notes = analyze_smc_setup(macro, setup, ltf, cfg, btc_context=ctx_for_pair)
+            if is_btc:
+                btc_context = {
+                    "bias": info.get("bias_1h", "NEUTRAL").lower(),
+                    "trend_4h": info.get("trend_4h", "RANGE"),
+                    "price": info.get("current_price", 0.0)
+                }
             print_smc_structure_box(sym, info)
             for n in notes:
                 print(f" • [{sym}] {n}")
